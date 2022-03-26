@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"encoding/xml"
 	"errors"
 	"fmt"
@@ -10,6 +11,8 @@ import (
 	"os"
 	"strconv"
 	"strings"
+
+	"github.com/tonymackay/finnhub-go"
 )
 
 type PortfolioRecord struct {
@@ -26,9 +29,14 @@ func readPortfolio() []PortfolioRecord {
 	}
 
 	var result []PortfolioRecord
-	for _, x := range strings.Split(string(dat), "\r\n") {
+	for _, assetLine := range strings.Split(string(dat), "\r\n") {
 		var r PortfolioRecord
-		splitString := strings.Split(string(x), " ")
+		splitString := strings.Split(string(assetLine), " ")
+		if len(splitString) != 3 {
+			fmt.Printf("Invalid asset: %s\n", assetLine)
+			continue
+		}
+
 		r.RecordType = splitString[0]
 		r.Symbol = splitString[1]
 		r.Amount, _ = strconv.Atoi(splitString[2])
@@ -38,21 +46,31 @@ func readPortfolio() []PortfolioRecord {
 	return result
 }
 
-func readToken() string {
-	dat, err := os.ReadFile("token.txt")
+func readFinnhubToken() string {
+	token, err := os.ReadFile("token.txt")
 	if errors.Is(err, os.ErrNotExist) {
-		fmt.Print("Put your token into token.txt file")
+		fmt.Print("Put your finnhub token into token.txt file")
 		return ""
 	}
 
-	return string(dat)
+	return string(token)
 }
 
-func readDataFromBinance() string {
+func getStockPrice(client finnhub.Client, symbol string) float32 {
+	symbol1 := strings.ToUpper(symbol)
+	quote, err := client.Quote(symbol1)
+	if err != nil {
+		fmt.Printf("%v\n", err)
+	}
+
+	return quote.Current
+}
+
+func getPricesFromBinance() []map[string]interface{} {
 	response, err := http.Get("http://binance.com/api/v3/ticker/price")
 	if err != nil {
 		fmt.Print(err.Error())
-		return ""
+		return []map[string]interface{}{}
 	}
 
 	responseData, err := ioutil.ReadAll(response.Body)
@@ -60,41 +78,38 @@ func readDataFromBinance() string {
 		log.Fatal(err)
 	}
 
-	return string(responseData)
+	var prices []map[string]interface{}
+	err = json.Unmarshal(responseData, &prices)
+	if err != nil {
+		fmt.Print(err.Error())
+		return []map[string]interface{}{}
+	}
+
+	return prices
 }
 
-func getPriceFromBinance(responseData string, ticker string) float32 {
-
-	dataString := string(responseData)
-	dataString = dataString[:len(dataString)-1]
-	dataString = dataString[1:]
-	splitData := strings.Split(dataString, "},{")
-	for _, symbolAndPrice := range splitData {
-		splitString := strings.Split(symbolAndPrice, ",")
-		symbol := strings.Split(splitString[0], ":")[1]
-		if symbol != ("\"" + ticker + "\"") {
+func getPriceFromBinance(prices []map[string]interface{}, ticker string) float32 {
+	for _, asset := range prices {
+		if asset["symbol"].(string) != ticker {
 			continue
 		}
 
-		price := strings.Split(splitString[1], ":")[1]
-		price = price[:len(price)-1]
-		price = price[1:]
-		value, _ := strconv.ParseFloat(price, 32)
-		return float32(value)
+		price, _ := strconv.ParseFloat(asset["price"].(string), 32)
+		return float32(price)
 	}
 
 	return 0
 }
 
-type StockRecord struct {
+type Stock struct {
 	XMLName xml.Name `xml:"row"`
 	Ticker  string   `xml:"SECID,attr"`
 	Price   string   `xml:"PREVADMITTEDQUOTE,attr"`
 }
 
 type Stocks struct {
-	XMLName xml.Name      `xml:"rows"`
-	Stocks  []StockRecord `xml:"row"`
+	XMLName xml.Name `xml:"rows"`
+	Stocks  []Stock  `xml:"row"`
 }
 
 type Data struct {
@@ -103,17 +118,15 @@ type Data struct {
 	Content Stocks   `xml:"rows"`
 }
 
-type MoexResponse struct {
-	XMLName xml.Name `xml:"document"`
-	Content Data     `xml:"data"`
-}
-
 func getPriceFromMoex(ticker string, rubPrice float32) float32 {
-	response, err := http.Get("https://iss.moex.com/iss/engines/stock/markets/shares/boards/TQBR/securities.xml?iss.meta=off&iss.only=securities&securities.columns=SECID,PREVADMITTEDQUOTE")
+	if rubPrice == 0 {
+		return 0
+	}
 
+	response, err := http.Get("https://iss.moex.com/iss/engines/stock/markets/shares/boards/TQBR/securities.xml?iss.meta=off&iss.only=securities&securities.columns=SECID,PREVADMITTEDQUOTE")
 	if err != nil {
 		fmt.Print(err.Error())
-		os.Exit(1)
+		return 0
 	}
 
 	responseData, err := ioutil.ReadAll(response.Body)
@@ -121,19 +134,18 @@ func getPriceFromMoex(ticker string, rubPrice float32) float32 {
 		log.Fatal(err)
 	}
 
-	var moexDoc MoexResponse
+	var moexDoc struct {
+		XMLName xml.Name `xml:"document"`
+		Content Data     `xml:"data"`
+	}
 	xml.Unmarshal(responseData, &moexDoc)
-
-	// we iterate through every user within our users array and
-	// print out the user Type, their name, and their facebook url
-	// as just an example
-	for i := 0; i < len(moexDoc.Content.Content.Stocks); i++ {
-		if moexDoc.Content.Content.Stocks[i].Ticker != ticker {
+	for _, stock := range moexDoc.Content.Content.Stocks {
+		if stock.Ticker != ticker {
 			continue
 		}
 
-		value, _ := strconv.ParseFloat(moexDoc.Content.Content.Stocks[i].Price, 32)
-		return float32(value) / rubPrice
+		price, _ := strconv.ParseFloat(stock.Price, 32)
+		return float32(price) / rubPrice
 	}
 
 	return 0
